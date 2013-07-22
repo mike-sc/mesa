@@ -119,6 +119,7 @@ Support matrix (cubox, v2, gc600):
 
     Corrupted:
     [Scene] shadow    -> rendering corrupted about every 1/2 frames
+                         mesa keeps re-building the shader
 
     Shader assertion:
     [Scene] refract  -> missing instruction CMP
