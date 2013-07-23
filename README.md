@@ -35,7 +35,16 @@ export LIBTOOL_FOR_BUILD="/usr/bin/libtool" # important!
 ```
 
 - The etna gallium driver uses `libetnaviv.a` and its headers from the 
-  `etna_viv` project (https://github.com/laanwj/etna_viv) for low-level access and register descriptions.
+  `etna_viv` project (https://github.com/laanwj/etna_viv) for access to the kernel driver and register descriptions.
+  *You only need to build libetnaviv by running `make` in `native/etnaviv`*. The rest is part of the test
+  and reverse engineering framework, and not needed for the driver.
+
+```bash
+export GCABI=v2/v4/dove/imx6/...
+# rest of cross-compile target settings
+cd native/etnaviv
+make
+```
 
 Mesa cross compiling
 ---------------------

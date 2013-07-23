@@ -40,10 +40,12 @@
  *
  * TODO
  * * Allow loops   
+ * * Use an instruction scheduler
  */
-#include "etna_shader.h"
+#include "etna_compiler.h"
 #include "etna_asm.h"
 #include "etna_internal.h"
+#include "etna_debug.h"
 
 #include "tgsi/tgsi_iterate.h"
 #include "tgsi/tgsi_strings.h"
@@ -533,8 +535,7 @@ static struct etna_inst_dst convert_dst(struct etna_compile_data *cd, const stru
         .comps = in->Register.WriteMask,
     };
     struct etna_native_reg native_reg = cd->file[in->Register.File][in->Register.Index].native;
-    assert(native_reg.valid);
-    assert(!native_reg.is_tex && native_reg.rgroup == INST_RGROUP_TEMP); /* can only assign to temporaries */
+    assert(native_reg.valid && !native_reg.is_tex && native_reg.rgroup == INST_RGROUP_TEMP); /* can only assign to temporaries */
     rv.reg = native_reg.id;
     return rv;
 }
@@ -547,8 +548,7 @@ static struct etna_inst_tex convert_tex(struct etna_compile_data *cd, const stru
         .swiz = INST_SWIZ_IDENTITY
     };
     struct etna_native_reg native_reg = cd->file[in->Register.File][in->Register.Index].native;
-    assert(native_reg.is_tex);
-    assert(native_reg.valid);
+    assert(native_reg.is_tex && native_reg.valid);
     rv.id = native_reg.id;
     return rv;
 }
@@ -565,8 +565,27 @@ static struct etna_inst_src convert_src(struct etna_compile_data *cd, const stru
         // XXX .amode
     };
     struct etna_native_reg native_reg = cd->file[in->Register.File][in->Register.Index].native;
-    assert(native_reg.valid);
-    assert(!native_reg.is_tex);
+    assert(native_reg.valid && !native_reg.is_tex);
+    rv.rgroup = native_reg.rgroup;
+    rv.reg = native_reg.id;
+    return rv;
+}
+
+/* convert destination to source operand (for operation in place) 
+ * i.e,
+ *    MUL dst0.x__w, src0.xyzw, 2/PI
+ *    SIN dst0.x__w, dst0.xyzw
+ */
+static struct etna_inst_src convert_dst_to_src(struct etna_compile_data *cd,  const struct tgsi_full_dst_register *in)
+{
+    struct etna_inst_src rv = {
+        .use = 1,
+        .swiz = INST_SWIZ_IDENTITY, /* no swizzle needed, destination does selection */
+        .neg = 0,
+        .abs = 0,
+    };
+    struct etna_native_reg native_reg = cd->file[in->Register.File][in->Register.Index].native;
+    assert(native_reg.valid && !native_reg.is_tex);
     rv.rgroup = native_reg.rgroup;
     rv.reg = native_reg.id;
     return rv;
@@ -764,7 +783,7 @@ static void etna_compile_pass_generate_code(struct etna_compile_data *cd, const 
                 } break;
             case TGSI_OPCODE_LRP: assert(0); break; /* lowered by mesa to (op2 * (1.0f - op0)) + (op1 * op0) */
             case TGSI_OPCODE_CND: assert(0); break;
-            case TGSI_OPCODE_SQRT: /* XXX if HAS_SQRT_TRIG */
+            case TGSI_OPCODE_SQRT: /* only generated if HAS_SQRT_TRIG */
                 emit_inst(cd, &(struct etna_inst) {
                         .opcode = INST_OPCODE_SQRT,
                         .sat = sat,
@@ -836,16 +855,30 @@ static void etna_compile_pass_generate_code(struct etna_compile_data *cd, const 
                 break; 
             case TGSI_OPCODE_RCC: assert(0); break;
             case TGSI_OPCODE_DPH: assert(0); break; /* src0.x * src1.x + src0.y * src1.y + src0.z * src1.z + src1.w */ 
-            case TGSI_OPCODE_COS: /* XXX HAS_SQRT_TRIG */
-            case TGSI_OPCODE_SIN: /* XXX HAS_SQRT_TRIG */
-                assert(0); /* doesn't work now as-is */
-                /* TODO add divide by PI/2, re-use dest register */
-                emit_inst(cd, &(struct etna_inst) {
-                        .opcode = inst->Instruction.Opcode == TGSI_OPCODE_COS ? INST_OPCODE_COS : INST_OPCODE_SIN,
-                        .sat = sat,
-                        .dst = convert_dst(cd, &inst->Dst[0]),
-                        .src[2] = convert_src(cd, &inst->Src[0]), 
-                        });
+            case TGSI_OPCODE_COS: /* fall through */
+            case TGSI_OPCODE_SIN:
+                if(cd->specs->has_sin_cos_sqrt)
+                {
+                    /* XXX fall back to Taylor series if not HAS_SQRT_TRIG,
+                     * see i915_fragprog.c for a good example.
+                     */
+                    assert(0);
+                } else {
+                    /* add divide by PI/2, re-use dest register */
+                    emit_inst(cd, &(struct etna_inst) {
+                            .opcode = INST_OPCODE_MUL,
+                            .sat = 0,
+                            .dst = convert_dst(cd, &inst->Dst[0]),
+                            .src[0] = convert_src(cd, &inst->Src[0]), /* any swizzling happens here */
+                            .src[1] = alloc_imm_u32(cd, 2.0f/M_PI),
+                            });
+                    emit_inst(cd, &(struct etna_inst) {
+                            .opcode = inst->Instruction.Opcode == TGSI_OPCODE_COS ? INST_OPCODE_COS : INST_OPCODE_SIN,
+                            .sat = sat,
+                            .dst = convert_dst(cd, &inst->Dst[0]),
+                            .src[2] = convert_dst_to_src(cd, &inst->Dst[0]),
+                            });
+                }
                 break;
             case TGSI_OPCODE_DDX:
             case TGSI_OPCODE_DDY:
@@ -887,7 +920,10 @@ static void etna_compile_pass_generate_code(struct etna_compile_data *cd, const 
             case TGSI_OPCODE_BRA: assert(0); break; /* to be removed according to doc */
             case TGSI_OPCODE_CAL: assert(0); break; /* CALL */
             case TGSI_OPCODE_RET: assert(0); break;
-            case TGSI_OPCODE_CMP: assert(0); break;
+            case TGSI_OPCODE_CMP: /* componentwise dst = (src0 < 0) ? src1 : src2 */
+                /* XXX implement using SELECT */
+                assert(0);
+                break;
             case TGSI_OPCODE_SCS: assert(0); break;
             case TGSI_OPCODE_NRM: assert(0); break;
             case TGSI_OPCODE_DIV: assert(0); break;
@@ -1132,7 +1168,7 @@ static void assign_constants_and_immediates(struct etna_compile_data *cd)
         cd->file[TGSI_FILE_IMMEDIATE][idx].native.rgroup = INST_RGROUP_UNIFORM_0;
         cd->file[TGSI_FILE_IMMEDIATE][idx].native.id = cd->imm_base/4 + idx;
     }
-    printf("imm base: %i size: %i\n", cd->imm_base, cd->imm_size);
+    DBG_F(ETNA_COMPILER_MSGS, "imm base: %i size: %i\n", cd->imm_base, cd->imm_size);
 }
 
 /* Assign declared samplers to native texture units */
@@ -1425,15 +1461,15 @@ int etna_compile_shader_object(const struct etna_pipe_specs *specs, const struct
     /* list declarations */
     for(int x=0; x<cd->total_decls; ++x)
     {
-        printf("%i: %s,%d active=%i first_use=%i last_use=%i native=%i usage_mask=%x has_semantic=%i", x, tgsi_file_name(cd->decl[x].file), cd->decl[x].idx,
+        DBG_F(ETNA_COMPILER_MSGS, "%i: %s,%d active=%i first_use=%i last_use=%i native=%i usage_mask=%x has_semantic=%i", x, tgsi_file_name(cd->decl[x].file), cd->decl[x].idx,
                 cd->decl[x].active,
                 cd->decl[x].first_use, cd->decl[x].last_use, cd->decl[x].native.valid?cd->decl[x].native.id:-1,
                 cd->decl[x].usage_mask, 
                 cd->decl[x].has_semantic);
         if(cd->decl[x].has_semantic)
-            printf(" semantic_name=%s semantic_idx=%i",
+            DBG_F(ETNA_COMPILER_MSGS, " semantic_name=%s semantic_idx=%i",
                     tgsi_semantic_names[cd->decl[x].semantic.Name], cd->decl[x].semantic.Index);
-        printf("\n");
+        DBG_F(ETNA_COMPILER_MSGS, "\n");
     }
     /* XXX for PS we need to permute so that inputs are always in temporary 0..N-1.
      * There is no "switchboard" for varyings (AFAIK!). The output color, however, can be routed 
@@ -1447,15 +1483,15 @@ int etna_compile_shader_object(const struct etna_pipe_specs *specs, const struct
     /* list declarations */
     for(int x=0; x<cd->total_decls; ++x)
     {
-        printf("%i: %s,%d active=%i first_use=%i last_use=%i native=%i usage_mask=%x has_semantic=%i", x, tgsi_file_name(cd->decl[x].file), cd->decl[x].idx,
+        DBG_F(ETNA_COMPILER_MSGS, "%i: %s,%d active=%i first_use=%i last_use=%i native=%i usage_mask=%x has_semantic=%i", x, tgsi_file_name(cd->decl[x].file), cd->decl[x].idx,
                 cd->decl[x].active,
                 cd->decl[x].first_use, cd->decl[x].last_use, cd->decl[x].native.valid?cd->decl[x].native.id:-1,
                 cd->decl[x].usage_mask, 
                 cd->decl[x].has_semantic);
         if(cd->decl[x].has_semantic)
-            printf(" semantic_name=%s semantic_idx=%i",
+            DBG_F(ETNA_COMPILER_MSGS, " semantic_name=%s semantic_idx=%i",
                     tgsi_semantic_names[cd->decl[x].semantic.Name], cd->decl[x].semantic.Index);
-        printf("\n");
+        DBG_F(ETNA_COMPILER_MSGS, "\n");
     }
 
     /* pass 3: generate instructions
